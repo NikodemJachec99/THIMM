@@ -17,7 +17,7 @@ if 'stock_file_bytes' not in st.session_state:
     st.session_state.stock_filename = None
 
 st.title("Witaj w Kalkulatorze Zapotrzebowania Produkcyjnego!")
-st.subheader("SIEMA SIEMA ELO ELO")
+st.subheader("I JAK TA PODOBA SIĘ??????🤗🤗🤗")
 
 st.markdown("""
 ### Jak korzystać z aplikacji?
