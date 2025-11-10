@@ -1,96 +1,71 @@
 # pages/3_📊_Wyniki_i_Optymalizacja.py
-
 import streamlit as st
 import pandas as pd
-import io
 from utils import (
-    process_stock_file, 
-    run_as_is_simulation, 
-    run_optimized_simulation, 
-    get_year_week_from_col,
-    create_comparison_chart
+    normalize_forecast, normalize_stock, union_weeks,
+    simulate_all, build_summary, compute_batch_sizes, simulate_with_extra, export_report
 )
 
 st.set_page_config(page_title="Wyniki i Optymalizacja", page_icon="📊", layout="wide")
+st.title("Krok 3: Wyniki — AS-IS i propozycja działań dla wszystkich indeksów")
 
-st.title("Krok 3: Wyniki Analizy i Propozycja Optymalizacji")
-
-# Sprawdzenie, czy wszystkie potrzebne dane są w sesji
-if st.session_state.get('forecast_data') is None or st.session_state.get('stock_file_bytes') is None:
-    st.error("Brak kompletnych danych. Proszę wgrać plik prognozy i stanu magazynowego na odpowiednich stronach.")
+if st.session_state.forecast_df is None or st.session_state.stock_df is None:
+    st.warning("Wgraj najpierw prognozę i stan.")
     st.stop()
 
-# Główna logika aplikacji
-try:
-    forecast_df = st.session_state.forecast_data
-    stock_file_bytes = st.session_state.stock_file_bytes
-    stock_filename = st.session_state.stock_filename
-    
-    # Przetworzenie pliku stanu magazynowego
-    material_number, current_stock, weekly_zp_income, weekly_or_consumption, batch_size = process_stock_file(stock_file_bytes, stock_filename)
-    
-    st.header(f"Analiza dla indeksu: `{material_number}`", divider="blue")
-    st.write(f"Rzeczywisty bieżący stan magazynowy ('W magazynie'): **{current_stock:,.2f}**".replace(',', ' ').replace('.', ','))
-    if batch_size:
-        st.write(f"Wykryta standardowa partia produkcyjna (z pierwszego ZP): **{batch_size:,.2f}**".replace(',', ' ').replace('.', ','))
+# Przygotowanie danych
+forecast_map, week_cols = normalize_forecast(st.session_state.forecast_df)
+init_stock_map, incoming_map, itemcode_map = normalize_stock(st.session_state.stock_df)
 
-    if material_number not in forecast_df.index:
-        st.error(f"Błąd: Nie znaleziono materiału `{material_number}` w pliku z prognozą.")
-    else:
-        forecast_series = forecast_df.loc[material_number]
-        
-        aligned_income = pd.Series(0.0, index=forecast_series.index)
-        aligned_consumption = pd.Series(0.0, index=forecast_series.index)
-        for col_name in forecast_series.index:
-            parsed_info = get_year_week_from_col(col_name)
-            if parsed_info:
-                year, week = parsed_info
-                if (year, week) in weekly_zp_income.index: aligned_income[col_name] = weekly_zp_income[(year, week)]
-                if (year, week) in weekly_or_consumption.index: aligned_consumption[col_name] = weekly_or_consumption[(year, week)]
-        
-        # --- POPRAWIONA KOLEJNOŚĆ ---
-        # 1. NAJPIERW URUCHOM OBIE SYMULACJE I STWÓRZ OBIE TABELE DANYCH
-        as_is_data = run_as_is_simulation(current_stock, forecast_series, aligned_income, aligned_consumption)
-        df_as_is = pd.DataFrame(as_is_data)
+# Horyzont = unia tygodni z prognozy i dostaw
+weeks_union = union_weeks(forecast_map, incoming_map)
+st.write(f"**Horyzont tygodni:** {', '.join(weeks_union)}")
 
-        optimized_data = run_optimized_simulation(current_stock, forecast_series, aligned_income, aligned_consumption, batch_size)
-        df_optimized = pd.DataFrame(optimized_data)
+# Symulacja AS-IS
+results = simulate_all(init_stock_map, forecast_map, incoming_map, weeks_union)
 
-        # 2. DOPIERO TERAZ, MAJĄC DANE, STWÓRZ I WYŚWIETL WYKRES
-        st.header("Wizualne Porównanie Planów", divider="green")
-        with st.spinner("Generowanie wykresu porównawczego..."):
-            chart_file = create_comparison_chart(df_as_is, df_optimized)
-            st.image(chart_file)
-        
-        # 3. WYŚWIETL TABELĘ DIAGNOSTYCZNĄ (AS-IS)
-        st.header("1. Diagnoza Bieżącego Planu (AS-IS)", divider="gray")
-        st.info("Ta symulacja pokazuje problemy, które wystąpią, jeśli obecny plan **nie zostanie** zmieniony.")
-        st.dataframe(df_as_is.style.format(formatter="{:,.2f}", subset=pd.IndexSlice[:, df_as_is.columns[2:-1]])
-                    .apply(lambda r: ['background-color: #FFCDD2'] * len(r) if "BRAK" in r["Problem?"] 
-                            else ['background-color: #FFF9C4'] * len(r) if "NADMIAR" in r["Problem?"] 
-                            else [''] * len(r), axis=1), use_container_width=True)
+# Rozmiary partii/serii
+batch_map = compute_batch_sizes(st.session_state.stock_df)
 
-        # 4. WYŚWIETL TABELĘ OPTYMALIZACYJNĄ (TO-BE)
-        st.header("2. Propozycja Zoptymalizowanego Planu (TO-BE)", divider="blue")
-        st.info("Ta symulacja pokazuje rekomendowany, skorygowany plan. Poniższa tabela zawiera wszystkie niezbędne akcje i ich wpływ na stan magazynowy.")
-        
-        with st.expander("Kliknij, aby zobaczyć legendę tabeli TO-BE"):
-            st.markdown("""
-            - **Akcja Korygująca**: Informuje o działaniach podjętych przez algorytm w celu optymalizacji planu:
-                - `🔴 PRODUKCJA`: Wskazuje na konieczność uruchomienia produkcji o podanej ilości.
-                - `🟡➡️ PRZESUNIĘTO`: Informuje, że zaplanowana na ten tydzień dostawa ZP została wirtualnie przesunięta na wskazany, późniejszy termin.
-                - `🟡⬅️ PRZYJĘTO`: Informuje, że w tym tygodniu wirtualnie przyjęto dostawę ZP, która została przesunięta z wcześniejszego terminu.
-            """)
-        
-        def style_actions(row):
-            style = [''] * len(row)
-            action = row["Akcja Korygująca"]
-            if "PRODUKCJA" in action: style = ['background-color: #C8E6C9'] * len(row) # Green
-            elif "PRZESUNIĘTO" in action or "PRZYJĘTO" in action: style = ['background-color: #FFFACD'] * len(row) # Yellow
-            return style
-        st.dataframe(df_optimized.style.format(formatter="{:,.2f}", subset=["Zapas na pocz. tyg.", "Przychód (ZP)", "Rozchód (OR)", "Popyt (prognoza)", "Zapas na kon. tyg.", "Bufor (popyt nast. tyg.)"])
-                    .apply(style_actions, axis=1), use_container_width=True)
+# Tabela podsumowująca
+summary = build_summary(results, itemcode_map=itemcode_map, batch_map=batch_map)
 
-except Exception as e:
-    st.error(f"Wystąpił nieoczekiwany błąd podczas generowania raportu: {e}")
-    st.exception(e)
+st.subheader("Podsumowanie (dla wszystkich indeksów)", divider="green")
+st.dataframe(summary, use_container_width=True)
+
+# Symulacja TO-BE: dogenerowanie brakującej ilości w tygodniu pierwszego deficytu
+extra_map = {}
+for _, row in summary.iterrows():
+    req = float(row['ProposedProduction'])
+    if req>0:
+        kw = row['FirstShortageWeek'] if row['FirstShortageWeek'] else (weeks_union[0] if weeks_union else None)
+        if kw:
+            extra_map[row['Materialnummer']] = (kw, req)
+tobe = simulate_with_extra(results, weeks_union, extra_map)
+
+# Eksport raportu (Summary + karty indeksów z AS-IS i TO-BE)
+if st.button("📥 Pobierz raport Excel (Summary + szczegóły AS-IS/TO-BE)"):
+    path = export_report(summary, results, tobe, "Raport_THIMM_All_SKU.xlsx")
+    with open(path, "rb") as f:
+        st.download_button("Pobierz Raport", f, file_name="Raport_THIMM_All_SKU.xlsx")
+
+# Wskazówki
+with st.expander("Założenia i mapowanie kolumn — kliknij, aby rozwinąć"):
+    st.markdown("""
+    **Prognoza** (`Forecast.xlsx`):
+    - Oczekiwane kolumny: `Materialnummer` oraz kolumny tygodniowe w formacie `KW nn/yy`.
+    - Jeśli nazwy są inne, aplikacja podejmie próbę automatycznego wykrycia tygodni i kolumny materiału.
+
+    **Zapas/Stan** (`Dostępne ilości`):
+    - Kluczowe kolumny: `numer indeksu` → *Materialnummer*, `ItemCode`, `nazwa` (ZP/ZS/OR), `Data dostawy`, `Zamówione`, `Potwierdzone`, `w magazynie`.
+    - Dostawy liczymy tak:
+        - `ZP` → kolumna **Zamówione**,
+        - `ZS/OR` → kolumna **Potwierdzone**,
+        - jeśli typ jest inny → **Potwierdzone** (jeśli >0) w przeciwnym razie **Zamówione**.
+    - Startowy stan magazynu bierzemy jako maksymalny `w magazynie` dla danego indeksu (przyjmujemy, że wartości są stałe w obrębie indeksu).
+
+    **Symulacja**:
+    - AS-IS: `stock[t] = stock[t-1] + incoming[t] - forecast[t]`.
+    - Deficyt = minimum stanu w horyzoncie poniżej zera; **RequiredReplenishment** = `max(0, -min_stock)`.
+    - Proponowana produkcja (**ProposedProduction**) — zaokrąglona do partii (jeśli da się ją wyestymować z wielkości ZP), wstrzyknięta w tygodniu pierwszego deficytu.
+    """)
